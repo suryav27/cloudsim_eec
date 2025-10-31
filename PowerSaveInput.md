@@ -15,10 +15,10 @@ machine class:
 
 machine class:
 {
-    Number of machines: 6
+    Number of machines: 4
     CPU type: ARM
     Number of cores: 16
-    Memory: 16384
+    Memory: 8192
     S-States: [100, 80, 55, 35, 15, 5, 0]
     P-States: [10, 7, 5, 3]
     C-States: [10, 3, 1, 0]
@@ -26,49 +26,64 @@ machine class:
     GPUs: no
 }
 
-Number of workloads: 3
+Number of workloads: 4
 
 task class:
 {
-    Start time: 50000
-    End time: 600000
-    Inter arrival: 10000
-    Expected runtime: 100000
-    Memory: 6
+    Start time: 100000
+    End time: 300000
+    Inter arrival: 120000
+    Expected runtime: 50000
+    Memory: 4
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA0
     CPU type: X86
     Task type: WEB
-    Seed: 222
+    Seed: 1001
 }
 
 task class:
 {
-    Start time: 100000
-    End time: 900000
-    Inter arrival: 20000
-    Expected runtime: 200000
-    Memory: 8
-    VM type: LINUX
-    GPU enabled: yes
-    SLA type: SLA1
-    CPU type: X86
-    Task type: AI
-    Seed: 333
-}
-
-task class:
-{
-    Start time: 200000
-    End time: 1000000
-    Inter arrival: 25000
-    Expected runtime: 150000
-    Memory: 6
+    Start time: 600000
+    End time: 800000
+    Inter arrival: 100000
+    Expected runtime: 60000
+    Memory: 4
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA1
     CPU type: ARM
     Task type: CRYPTO
-    Seed: 444
+    Seed: 1002
+}
+
+task class:
+{
+    Start time: 1000000
+    End time: 1600000
+    Inter arrival: 200000
+    Expected runtime: 150000
+    Memory: 8
+    VM type: LINUX
+    GPU enabled: yes
+    SLA type: SLA0
+    CPU type: X86
+    Task type: AI
+    Seed: 1003
+}
+
+task class:
+{
+    Start time: 1800000
+    End time: 2500000
+    Inter arrival: 250000
+    Expected runtime: 80000
+    Memory: 6
+    VM type: LINUX
+    GPU enabled: no
+    SLA type: SLA2
+    CPU type: ARM
+    Task type: STREAM
+    Seed: 1004
 }

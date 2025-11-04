@@ -2,7 +2,7 @@ Number of machine classes: 1
 
 machine class:
 {
-    Number of machines: 20
+    Number of machines: 8
     CPU type: X86
     Number of cores: 8
     Memory: 16384
@@ -18,10 +18,10 @@ Number of workloads: 2
 task class:
 {
     Start time: 100000
-    End time: 10000000
-    Inter arrival: 30000
-    Expected runtime: 500000
-    Memory: 1024
+    End time: 2000000
+    Inter arrival: 20000
+    Expected runtime: 250000
+    Memory: 512
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA0
@@ -32,15 +32,15 @@ task class:
 
 task class:
 {
-    Start time: 100000
-    End time: 10000000
-    Inter arrival: 45000
-    Expected runtime: 400000
-    Memory: 2048
+    Start time: 200000
+    End time: 2500000
+    Inter arrival: 30000
+    Expected runtime: 350000
+    Memory: 1024
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA1
     CPU type: X86
     Task type: STREAM
-    Seed: 456
+    Seed: 234
 }

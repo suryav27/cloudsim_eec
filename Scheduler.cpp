@@ -33,12 +33,27 @@ void Scheduler::Init() {
     SimOutput("Scheduler::Init(): Machines discovered = " + to_string(machines.size()) + ". VMs will be created on demand.", 2);
 }
 
-
+double Scheduler::GetMachineUtilization(MachineId_t m) {
+    auto mi = Machine_GetInfo(m);
+    double used = mi.memory_used;
+    double total = mi.memory_size;
+    return (total == 0) ? 0 : (used / total);
+}
 
 
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     // Update your data structure. The VM now can receive new tasks
+    // Find record for vm_id; refresh host from VM_GetInfo
+    for (auto &rec : vmrecs) {
+        if (rec.id == vm_id) {
+            auto vmi = VM_GetInfo(vm_id);
+            rec.host = vmi.machine_id; // authoritative new host
+            break;
+        }
+    }
+    migrating = false;
+
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -59,85 +74,132 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    CPUType_t need_cpu = RequiredCPUType(task_id);   // X86 or ARM
+    // --- Query task requirements ---
+    CPUType_t need_cpu = RequiredCPUType(task_id);   // X86 / ARM
     VMType_t  need_vm  = RequiredVMType(task_id);    // LINUX / WIN / ...
     SLAType_t sla      = RequiredSLA(task_id);       // SLA0..SLA3
-    bool      need_gpu = IsTaskGPUCapable(task_id);  // true if GPU needed
-    unsigned  mem_req  = GetTaskMemory(task_id);     // bytes (per Interfaces.h)
+    bool      need_gpu = IsTaskGPUCapable(task_id);  // GPU flag
+    unsigned  mem_req  = GetTaskMemory(task_id);     // memory requirement (units consistent with MachineInfo)
 
-    // Priority policy (example)
+    // --- Priority from SLA (simple mapping) ---
     Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
-                     sla == SLA1 ? MID_PRIORITY   : LOW_PRIORITY);
+                    (sla == SLA1 ? MID_PRIORITY   : LOW_PRIORITY));
 
-    // 1) Pick the best existing VM (least running_tasks) that satisfies constraints
-    size_t chosen_idx = SIZE_MAX;
-    size_t least_tasks = SIZE_MAX;
+    // --- Best-Fit search among existing VMs (consolidation) ---
+    double best_gap = 1e18;
+    double best_tiebreak_util = -1.0;
+    size_t best_idx = SIZE_MAX;
 
     for (size_t i = 0; i < vmrecs.size(); ++i) {
         const auto& rec = vmrecs[i];
-        if (rec.cpu_type != need_cpu) continue;             // CPU family must match
-        if (need_gpu && !rec.host_has_gpu) continue;        // need GPU
-        if (rec.vm_type != need_vm) continue;               // OS type (LINUX/WIN/...)
 
-        // Optional memory fit (only if your MachineInfo has memory_used/size)
+        // Hard constraints
+        if (rec.cpu_type != need_cpu) continue;
+        if (need_gpu && !rec.host_has_gpu) continue;
+        if (rec.vm_type != need_vm) continue;
+
+        // Current host capacity
         auto mi = Machine_GetInfo(rec.host);
-        if (mi.memory_size >= mi.memory_used) {
-            unsigned free_mem = mi.memory_size - mi.memory_used;
-            if (free_mem < mem_req) continue;
-        }
-        // choose least-loaded VM
-        if (rec.running_tasks < least_tasks) {
-            least_tasks = rec.running_tasks;
-            chosen_idx  = i;
+        if (mi.memory_used > mi.memory_size) continue;              // defensive
+        unsigned free_mem = mi.memory_size - mi.memory_used;
+        if (free_mem < mem_req) continue;
+
+        // Best-fit gap (smaller is better)
+        double gap = static_cast<double>(free_mem) - static_cast<double>(mem_req);
+
+        // Tie-break: prefer higher host utilization (tighter packing)
+        double util = GetMachineUtilization(rec.host);
+
+        if (gap < best_gap || (gap == best_gap && util > best_tiebreak_util)) {
+            best_gap = gap;
+            best_tiebreak_util = util;
+            best_idx = i;
         }
     }
 
     VMId_t chosen_vm;
+    size_t chosen_idx;
 
-    // 2) If none exists, create a new compatible VM on a compatible host
-    if (chosen_idx == SIZE_MAX) {
-        MachineId_t host = (MachineId_t)(-1);
+    // --- If no existing VM fits, create one on the best host (prefer already-on, utilized hosts) ---
+    if (best_idx == SIZE_MAX) {
+        MachineId_t chosen_host = (MachineId_t)(-1);
+        double best_host_util = -1.0;
+        double best_host_gap  = 1e18;
+
+        // First pass: prefer hosts that are already S0 (awake) to avoid wakeup penalties
         for (auto m : machines) {
             auto mi = Machine_GetInfo(m);
             if (mi.cpu != need_cpu) continue;
             if (need_gpu && !mi.gpus) continue;
 
-            // Optional memory fit
-            if (mi.memory_size >= mi.memory_used) {
+            if (mi.memory_used > mi.memory_size) continue;
+            unsigned free_mem = mi.memory_size - mi.memory_used;
+            if (free_mem < mem_req) continue;
+
+            if (mi.s_state == S0) {
+                double gap  = static_cast<double>(free_mem) - static_cast<double>(mem_req);
+                double util = GetMachineUtilization(m);
+                if (gap < best_host_gap || (gap == best_host_gap && util > best_host_util)) {
+                    best_host_gap  = gap;
+                    best_host_util = util;
+                    chosen_host = m;
+                }
+            }
+        }
+
+        // Second pass: if nothing woke, allow waking a sleeping compatible host
+        if (chosen_host == (MachineId_t)(-1)) {
+            for (auto m : machines) {
+                auto mi = Machine_GetInfo(m);
+                if (mi.cpu != need_cpu) continue;
+                if (need_gpu && !mi.gpus) continue;
+
+                if (mi.memory_used > mi.memory_size) continue;
                 unsigned free_mem = mi.memory_size - mi.memory_used;
                 if (free_mem < mem_req) continue;
+
+                // Wake this one and take it
+                if (mi.s_state != S0) Machine_SetState(m, S0);
+                chosen_host = m;
+                break;
             }
-
-            if (mi.s_state != S0) Machine_SetState(m, S0);  // wake host
-            host = m; break;
         }
-        if (host == (MachineId_t)(-1)) {
+
+        if (chosen_host == (MachineId_t)(-1)) {
             SimOutput("NewTask(): No compatible host for task " + to_string(task_id), 0);
-            return; // or queue it
+            return; // could queue instead
         }
 
+        // Create and attach a new compatible VM
         VMId_t vm = VM_Create(need_vm, need_cpu);
-        VM_Attach(vm, host);
+        VM_Attach(vm, chosen_host);
 
-        auto mi = Machine_GetInfo(host);
+        auto host_info = Machine_GetInfo(chosen_host);
         vmrecs.push_back(VMRec{
-            .id           = vm,
-            .host         = host,
-            .vm_type      = need_vm,
-            .cpu_type     = need_cpu,
-            .host_has_gpu = mi.gpus,
-            .running_tasks= 0
+            .id            = vm,
+            .host          = chosen_host,
+            .vm_type       = need_vm,
+            .cpu_type      = need_cpu,
+            .host_has_gpu  = host_info.gpus,
+            .running_tasks = 0,
+            .vm_mem_used   = 0,
+            .tasks         = {}
         });
-        chosen_idx = vmrecs.size() - 1;
+
         chosen_vm  = vm;
+        chosen_idx = vmrecs.size() - 1;
     } else {
-        chosen_vm  = vmrecs[chosen_idx].id;   // <- SET chosen from chosen_idx
+        chosen_idx = best_idx;
+        chosen_vm  = vmrecs[best_idx].id;
     }
 
-    // 3) Assign the task and update our bookkeeping
+    // --- Assign task and update scheduler bookkeeping ---
     VM_AddTask(chosen_vm, task_id, pr);
     vmrecs[chosen_idx].running_tasks++;
+    vmrecs[chosen_idx].vm_mem_used += mem_req;
+    vmrecs[chosen_idx].tasks.push_back(task_id);
     task_to_vm_index[task_id] = chosen_idx;
+
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -145,7 +207,87 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+    // Example migration trigger: source host underutilized (by mem or tasks)
+    static constexpr double LOW_UTIL_THRESHOLD = 0.30;  // host underutilized if below
+    static constexpr Time_t IDLE_TO_S3 = 50000;         // 50 ms to go to S3
+    static constexpr Time_t IDLE_TO_S5 = 200000;        // 200 ms to go to S5
+
+
+    // --------- Try to consolidate: migrate VMs off underutilized hosts ----------
+    // Strategy: for each VM whose host is underutilized, try to move it to a better (more utilized) compatible host,
+    // using a best-fit-by-free-memory destination to pack tightly.
+    for (size_t s = 0; s < vmrecs.size(); ++s) {
+        auto &src_vm = vmrecs[s];
+        if (src_vm.running_tasks == 0) continue; // nothing to migrate
+
+        auto mi_src_host = Machine_GetInfo(src_vm.host);
+        double src_util  = GetMachineUtilization(src_vm.host);
+        if (src_util >= LOW_UTIL_THRESHOLD) continue; // only nudge clearly underutilized hosts
+
+        // Choose best destination host (best-fit on free mem; tie-break by higher util)
+        MachineId_t best_dst_host = (MachineId_t)(-1);
+        double      best_gap      = 1e18;
+        double      best_util     = -1.0;
+
+        for (size_t d = 0; d < vmrecs.size(); ++d) {
+            if (d == s) continue;
+            const auto &dst_vm = vmrecs[d];
+
+            // VM-level constraints must remain valid on destination host
+            if (dst_vm.cpu_type != src_vm.cpu_type) continue;
+            if (src_vm.host_has_gpu && !dst_vm.host_has_gpu) continue;
+            if (dst_vm.vm_type != src_vm.vm_type) continue;
+
+            auto mi_dst = Machine_GetInfo(dst_vm.host);
+            if (mi_dst.memory_used > mi_dst.memory_size) continue; // defensive
+            unsigned free_mem = mi_dst.memory_size - mi_dst.memory_used;
+
+            if (free_mem < src_vm.vm_mem_used) continue; // must fit the whole VM’s footprint
+
+            double gap  = static_cast<double>(free_mem) - static_cast<double>(src_vm.vm_mem_used);
+            double util = GetMachineUtilization(dst_vm.host);
+
+            if (gap < best_gap || (gap == best_gap && util > best_util)) {
+                best_gap  = gap;
+                best_util = util;
+                best_dst_host = dst_vm.host;
+            }
+        }
+
+        // Perform one migration at a time to avoid thrashing
+        if (best_dst_host != (MachineId_t)(-1)) {
+            VM_Migrate(src_vm.id, best_dst_host);
+            migrating = true;
+            SimOutput("PeriodicCheck(): Migrating VM " + to_string(src_vm.id) +
+                      " from host " + to_string(src_vm.host) +
+                      " to host " + to_string(best_dst_host), 3);
+            // Let MigrationDone()/MigrationComplete() fix up the host field when sim confirms.
+            break; // one migration per check is usually enough; remove 'break' to be more aggressive
+        }
+    }
+
+    // --------- Power management with hysteresis (S3 then S5) ----------
+    for (auto m : machines) {
+        auto mi = Machine_GetInfo(m);
+
+        if (mi.active_vms == 0) {
+            // track idle time
+            if (!idle_since.count(m)) idle_since[m] = now;
+            Time_t idle = now - idle_since[m];
+
+            if (idle >= IDLE_TO_S5) {
+                if (mi.s_state != S5) Machine_SetState(m, S5);
+            } else if (idle >= IDLE_TO_S3) {
+                if (mi.s_state == S0) Machine_SetState(m, S3);
+            }
+        } else {
+            // host is in use → must be awake
+            idle_since.erase(m);
+            if (mi.s_state != S0) Machine_SetState(m, S0);
+        }
+    }
 }
+
 
 void Scheduler::Shutdown(Time_t time) {
     // Do your final reporting and bookkeeping here.
@@ -167,7 +309,13 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     if (it != task_to_vm_index.end()) {
         size_t idx = it->second;
         if (idx < vmrecs.size() && vmrecs[idx].running_tasks > 0)
-            vmrecs[idx].running_tasks--;
+            vmrecs[idx].running_tasks--;  
+    if (idx < vmrecs.size()) {
+        auto mem_req = GetTaskMemory(task_id);
+        if (vmrecs[idx].vm_mem_used >= mem_req)
+            vmrecs[idx].vm_mem_used -= mem_req;
+    }
+                
         task_to_vm_index.erase(it);
     }
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);

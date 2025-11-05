@@ -1,6 +1,6 @@
 //
 //  Scheduler.cpp
-//  CloudSim
+//  Consolidation based- best fit decreasing 
 //
 //  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
 //
@@ -312,7 +312,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
     // Example migration trigger: source host underutilized (by mem or tasks)
-    static constexpr double LOW_UTIL_THRESHOLD = 0.30;  // host underutilized if below
+    static constexpr double LOW_UTIL_THRESHOLD = 0.20;  // host underutilized if below
     static constexpr Time_t IDLE_TO_S3 = 50000;         // 50 ms to go to S3
     static constexpr Time_t IDLE_TO_S5 = 200000;        // 200 ms to go to S5
 

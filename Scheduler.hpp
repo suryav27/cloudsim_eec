@@ -42,7 +42,7 @@ private:
     std::vector<PendingItem> pending;
     std::unordered_map<MachineId_t, Time_t> idle_since;
     Time_t last_flush = 0;
-    static constexpr size_t BFD_BATCH = 16;
+    static constexpr size_t BFD_BATCH = 4;
     static constexpr Time_t  BFD_MAX_WAIT = 30000;
     static constexpr Time_t IDLE_TO_S3 = 50000;
     static constexpr Time_t IDLE_TO_S5 = 200000;

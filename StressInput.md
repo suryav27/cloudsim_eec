@@ -2,7 +2,7 @@ Number of machine classes: 2
 
 machine class:
 {
-    Number of machines: 2
+    Number of machines: 3
     CPU type: X86
     Number of cores: 8
     Memory: 8192
@@ -15,7 +15,7 @@ machine class:
 
 machine class:
 {
-    Number of machines: 2
+    Number of machines: 3
     CPU type: ARM
     Number of cores: 16
     Memory: 8192
@@ -32,9 +32,9 @@ task class:
 {
     Start time: 0
     End time: 1000000
-    Inter arrival: 3000
+    Inter arrival: 4000
     Expected runtime: 150000
-    Memory: 2
+    Memory: 8
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA0
@@ -45,11 +45,11 @@ task class:
 
 task class:
 {
-    Start time: 0
-    End time: 1000000
-    Inter arrival: 4000
+    Start time: 200000
+    End time: 1200000
+    Inter arrival: 5000
     Expected runtime: 180000
-    Memory: 16
+    Memory: 10
     VM type: LINUX
     GPU enabled: yes
     SLA type: SLA1
@@ -60,11 +60,11 @@ task class:
 
 task class:
 {
-    Start time: 0
-    End time: 1000000
-    Inter arrival: 5000
+    Start time: 400000
+    End time: 1300000
+    Inter arrival: 6000
     Expected runtime: 200000
-    Memory: 8
+    Memory: 6
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA1
@@ -75,11 +75,11 @@ task class:
 
 task class:
 {
-    Start time: 0
-    End time: 1000000
-    Inter arrival: 3500
+    Start time: 600000
+    End time: 1400000
+    Inter arrival: 7000
     Expected runtime: 150000
-    Memory: 10
+    Memory: 4
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA0
@@ -90,11 +90,11 @@ task class:
 
 task class:
 {
-    Start time: 0
-    End time: 1000000
-    Inter arrival: 6000
+    Start time: 800000
+    End time: 1500000
+    Inter arrival: 8000
     Expected runtime: 100000
-    Memory: 20
+    Memory: 8
     VM type: LINUX
     GPU enabled: yes
     SLA type: SLA2
@@ -105,11 +105,11 @@ task class:
 
 task class:
 {
-    Start time: 0
-    End time: 1000000
-    Inter arrival: 7000
+    Start time: 1000000
+    End time: 1600000
+    Inter arrival: 9000
     Expected runtime: 90000
-    Memory: 4
+    Memory: 6
     VM type: LINUX
     GPU enabled: no
     SLA type: SLA2

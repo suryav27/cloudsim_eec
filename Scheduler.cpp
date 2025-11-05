@@ -140,6 +140,24 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     task_to_vm_index[task_id] = chosen_idx;
 }
 
+void Scheduler::MaybeAdjustPState(MachineId_t m, double util, Time_t now) {
+    CPUPerformance_t target = PickPState(util);
+    auto cur_it = machine_pstate.find(m);
+    CPUPerformance_t current = (cur_it == machine_pstate.end()) ? P0 : cur_it->second;
+
+    bool increasing_perf = (target < current);
+    Time_t since = (last_p_change.count(m) ? now - last_p_change[m] : PSTATE_COOLDOWN + 1);
+
+    if (increasing_perf || since > PSTATE_COOLDOWN) {
+        machine_pstate[m] = target;
+        last_p_change[m] = now;
+        string level = (target == P0 ? "P0 (Max Freq)" :
+                        target == P1 ? "P1 (High)" :
+                        target == P2 ? "P2 (Medium)" : "P3 (Low)");
+        SimOutput("DVFS: Adjusted Host " + to_string(m) + " → " + level, 3);
+    }
+}
+
 void Scheduler::PeriodicCheck(Time_t now) {
     // This method should be called from SchedulerCheck()
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
@@ -229,8 +247,24 @@ void SimulationComplete(Time_t time) {
     scheduler.Shutdown(time);
 }
 
+void Scheduler::HandleSLAWarning(Time_t time, TaskId_t task_id) {
+    auto it = task_to_vm_index.find(task_id);
+    if (it != task_to_vm_index.end()) {
+        size_t idx = it->second;
+        if (idx < vmrecs.size()) {
+            MachineId_t host = vmrecs[idx].host;
+            auto cur = machine_pstate[host];
+            if (cur != P0) {
+                machine_pstate[host] = CPUPerformance_t(cur - 1);
+                SimOutput("DVFS: SLA boost on Host " + to_string(host), 3);
+            }
+        }
+    }
+}
+
+
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    
+    scheduler.HandleSLAWarning(time, task_id);
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {

@@ -6,6 +6,7 @@
 //
 
 #include "Scheduler.hpp"
+#include <algorithm> // Required for std::sort
 
 static bool migrating = false;
 
@@ -56,6 +57,101 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 
 }
 
+void Scheduler::FlushPending() {
+    // Sort pending tasks in decreasing order of memory (BFD requirement)
+    std::sort(pending.begin(), pending.end(),
+        [](const PendingItem &a, const PendingItem &b) {
+            return a.mem > b.mem; // descending
+        });
+
+    // Place each pending task using the same best-fit logic as NewTask
+    for (auto &item : pending) {
+        TaskId_t tid = item.tid;
+        unsigned mem_req = item.mem;
+        CPUType_t need_cpu = item.cpu;
+        VMType_t  need_vm  = item.vm;
+        SLAType_t sla      = item.sla;
+        bool      need_gpu = item.gpu;
+
+        Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
+                        (sla == SLA1 ? MID_PRIORITY : LOW_PRIORITY));
+
+        // --- Best-fit placement identical to your NewTask code ---
+        double best_gap = 1e18;
+        double best_tiebreak_util = -1.0;
+        size_t best_idx = SIZE_MAX;
+
+        for (size_t i = 0; i < vmrecs.size(); ++i) {
+            const auto& rec = vmrecs[i];
+            if (rec.cpu_type != need_cpu) continue;
+            if (need_gpu && !rec.host_has_gpu) continue;
+            if (rec.vm_type != need_vm) continue;
+
+            auto mi = Machine_GetInfo(rec.host);
+            unsigned free_mem = mi.memory_size - mi.memory_used;
+            if (free_mem < mem_req) continue;
+
+            double gap = (double)(free_mem - mem_req);
+            double util = GetMachineUtilization(rec.host);
+            if (gap < best_gap || (gap == best_gap && util > best_tiebreak_util)) {
+                best_gap = gap;
+                best_tiebreak_util = util;
+                best_idx = i;
+            }
+        }
+
+        VMId_t chosen_vm;
+        size_t chosen_idx;
+
+        if (best_idx == SIZE_MAX) {
+            // Create new host+VM if no fit (same as your code)
+            MachineId_t chosen_host = (MachineId_t)(-1);
+            for (auto m : machines) {
+                auto mi = Machine_GetInfo(m);
+                if (mi.cpu != need_cpu) continue;
+                if (need_gpu && !mi.gpus) continue;
+                unsigned free_mem = mi.memory_size - mi.memory_used;
+                if (free_mem >= mem_req) {
+                    if (mi.s_state != S0) Machine_SetState(m, S0);
+                    chosen_host = m;
+                    break;
+                }
+            }
+            if (chosen_host == (MachineId_t)(-1)) {
+                SimOutput("FlushPending(): No compatible host for task " + to_string(tid), 0);
+                continue;
+            }
+
+            VMId_t vm = VM_Create(need_vm, need_cpu);
+            VM_Attach(vm, chosen_host);
+            auto host_info = Machine_GetInfo(chosen_host);
+            vmrecs.push_back(VMRec{
+                .id            = vm,
+                .host          = chosen_host,
+                .vm_type       = need_vm,
+                .cpu_type      = need_cpu,
+                .host_has_gpu  = host_info.gpus,
+                .running_tasks = 0,
+                .vm_mem_used   = 0,
+                .tasks         = {}
+            });
+            chosen_vm  = vm;
+            chosen_idx = vmrecs.size() - 1;
+        } else {
+            chosen_vm  = vmrecs[best_idx].id;
+            chosen_idx = best_idx;
+        }
+
+        VM_AddTask(chosen_vm, tid, pr);
+        vmrecs[chosen_idx].running_tasks++;
+        vmrecs[chosen_idx].vm_mem_used += mem_req;
+        vmrecs[chosen_idx].tasks.push_back(tid);
+        task_to_vm_index[tid] = chosen_idx;
+    }
+
+    pending.clear();
+}
+
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Get the task parameters
     //  IsGPUCapable(task_id);
@@ -81,6 +177,14 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     bool      need_gpu = IsTaskGPUCapable(task_id);  // GPU flag
     unsigned  mem_req  = GetTaskMemory(task_id);     // memory requirement (units consistent with MachineInfo)
 
+    // Buffer this task for batch placement (BFD batching)
+    pending.push_back({task_id, mem_req, need_cpu, need_vm, need_gpu, sla, now});
+
+    // If we’ve collected enough tasks, flush and place them all
+    if (pending.size() >= BFD_BATCH) {
+        FlushPending();
+    }
+    return;
     // --- Priority from SLA (simple mapping) ---
     Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
                     (sla == SLA1 ? MID_PRIORITY   : LOW_PRIORITY));
@@ -212,6 +316,10 @@ void Scheduler::PeriodicCheck(Time_t now) {
     static constexpr Time_t IDLE_TO_S3 = 50000;         // 50 ms to go to S3
     static constexpr Time_t IDLE_TO_S5 = 200000;        // 200 ms to go to S5
 
+    if (!pending.empty() && (now - last_flush) > BFD_MAX_WAIT) {
+        FlushPending();
+        last_flush = now;
+    }
 
     // --------- Try to consolidate: migrate VMs off underutilized hosts ----------
     // Strategy: for each VM whose host is underutilized, try to move it to a better (more utilized) compatible host,
@@ -294,6 +402,9 @@ void Scheduler::Shutdown(Time_t time) {
     // Report about the total energy consumed
     // Report about the SLA compliance
     // Shutdown everything to be tidy :-)
+    if (!pending.empty()) {
+        FlushPending();   // flush any leftover unplaced tasks
+    }
     for(auto & vm: vmrecs) {
         VM_Shutdown(vm.id);
     }
@@ -349,7 +460,6 @@ void MigrationDone(Time_t time, VMId_t vm_id) {
     // The function is called on to alert you that migration is complete
     SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
     scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
 }
 
 void SchedulerCheck(Time_t time) {

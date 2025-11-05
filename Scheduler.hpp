@@ -38,6 +38,7 @@ public:
     
 private:
     double GetMachineUtilization(MachineId_t m);
+    void FlushPending();
     std::vector<PendingItem> pending;
     std::unordered_map<MachineId_t, Time_t> idle_since;
     Time_t last_flush = 0;

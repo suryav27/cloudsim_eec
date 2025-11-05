@@ -1,22 +1,155 @@
 //
 //  Scheduler.cpp
-//  CloudSim
-//
-//  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
+//  CloudSim – SLA-Aware Consolidation (final hardened wake-safe version)
 //
 
 #include "Scheduler.hpp"
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <unordered_set>
+#include <deque>
 
-static bool migrating = false;
+using namespace std;
 
+static constexpr double UPPER_UTIL_THRESH   = 0.80;
+static constexpr double LOWER_UTIL_THRESH   = 0.25;
+static constexpr double SLA_VIOLATION_LIMIT = 5.0;
+static constexpr unsigned MIGRATION_PERIOD  = 5;
 
-void Scheduler::Init() {
-    unsigned total = Machine_GetTotal();
-    if (total == 0) {
-        SimOutput("Scheduler::Init(): No machines available", 0);
-        return;
+static unsigned tick_counter = 0;
+
+// Track ongoing states
+static unordered_set<VMId_t> migrating_vms;
+static unordered_set<MachineId_t> waking_machines;
+static deque<TaskId_t> pending_tasks;
+
+// Deferred migrations
+struct PendingMigration {
+    VMId_t vm;
+    MachineId_t dst;
+};
+static deque<PendingMigration> pending_migrations;
+
+// ---------- helpers ----------
+static unsigned CountTasksOnMachine(const vector<VMRec>& vms, MachineId_t m) {
+    unsigned sum = 0;
+    for (const auto& r : vms)
+        if (r.host == m) sum += static_cast<unsigned>(r.running_tasks);
+    return sum;
+}
+
+static bool PickLeastLoadedHost(const vector<MachineId_t>& machines,
+                                const vector<VMRec>& vms,
+                                CPUType_t cpu,
+                                bool need_gpu,
+                                MachineId_t& out_host) {
+    double best_util = numeric_limits<double>::infinity();
+    bool found = false;
+    for (auto m : machines) {
+        auto mi = Machine_GetInfo(m);
+        if (mi.cpu != cpu) continue;
+        if (need_gpu && !mi.gpus) continue;
+        unsigned t = CountTasksOnMachine(vms, m);
+        double util = (mi.num_cpus == 0 ? 1.0 : double(t)/double(mi.num_cpus));
+        if (util < best_util) {
+            best_util = util;
+            out_host = m;
+            found = true;
+        }
+    }
+    return found;
+}
+
+// Try to place a task safely; defer if host is sleeping
+bool TryPlaceTask(vector<VMRec>& vmrecs,
+                  const vector<MachineId_t>& machines,
+                  unordered_map<TaskId_t, size_t>& task_to_vm_index,
+                  TaskId_t task_id) {
+    CPUType_t cpu      = RequiredCPUType(task_id);
+    VMType_t  vm_type  = RequiredVMType(task_id);
+    SLAType_t sla      = RequiredSLA(task_id);
+    bool      need_gpu = IsTaskGPUCapable(task_id);
+
+    Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
+                    (sla == SLA1 ? MID_PRIORITY : LOW_PRIORITY));
+
+    size_t best_vm = SIZE_MAX;
+    size_t best_tasks = numeric_limits<size_t>::max();
+
+    // Reuse existing ready VM
+    for (size_t i = 0; i < vmrecs.size(); ++i) {
+        const auto& rec = vmrecs[i];
+        if (rec.cpu_type != cpu || rec.vm_type != vm_type) continue;
+        if (migrating_vms.count(rec.id)) continue;
+        auto mi = Machine_GetInfo(rec.host);
+        if (need_gpu && !mi.gpus) continue;
+        if (mi.s_state != S0) continue;
+        if (rec.running_tasks < best_tasks) {
+            best_tasks = rec.running_tasks;
+            best_vm = i;
+        }
     }
 
+    if (best_vm == SIZE_MAX) {
+        // Pick a host
+        MachineId_t host = (MachineId_t)(-1);
+        if (!PickLeastLoadedHost(machines, vmrecs, cpu, need_gpu, host)) {
+            SimOutput("NewTask(): No compatible host for task " + to_string(task_id), 0);
+            return false;
+        }
+
+        auto mi = Machine_GetInfo(host);
+        if (mi.s_state != S0) {
+            if (!waking_machines.count(host)) {
+                Machine_SetState(host, S0);
+                waking_machines.insert(host);
+                SimOutput("NewTask(): Host " + to_string(host) +
+                          " waking up; deferring task " + to_string(task_id), 2);
+            }
+            return false;
+        }
+
+        VMId_t vm = VM_Create(vm_type, cpu);
+        VM_Attach(vm, host);
+        vmrecs.push_back(VMRec{vm, host, vm_type, cpu, mi.gpus, 0});
+        best_vm = vmrecs.size() - 1;
+    }
+
+    VM_AddTask(vmrecs[best_vm].id, task_id, pr);
+    vmrecs[best_vm].running_tasks++;
+    task_to_vm_index[task_id] = best_vm;
+
+    SimOutput("SLA-Aware Consolidation: Assigned task " + to_string(task_id) +
+              " → machine " + to_string(vmrecs[best_vm].host), 2);
+    return true;
+}
+
+static bool PickDestForConsolidation(const vector<MachineId_t>& machines,
+                                     const vector<VMRec>& vms,
+                                     CPUType_t cpu,
+                                     MachineId_t& out_dst) {
+    double best_util = numeric_limits<double>::infinity();
+    bool found = false;
+    for (auto m : machines) {
+        auto mi = Machine_GetInfo(m);
+        if (mi.cpu != cpu) continue;
+        unsigned t = CountTasksOnMachine(vms, m);
+        double util = (mi.num_cpus == 0 ? 1.0 : double(t) / double(mi.num_cpus));
+        if (util < UPPER_UTIL_THRESH && util < best_util) {
+            best_util = util;
+            out_dst = m;
+            found = true;
+        }
+    }
+    return found;
+}
+
+// ---------- Scheduler ----------
+void Scheduler::Init() {
+    unsigned total = Machine_GetTotal();
+    SimOutput("InitScheduler(): Initializing SLA-Aware Consolidation Scheduler", 2);
     vmrecs.clear();
     machines.clear();
     machines.reserve(total);
@@ -24,145 +157,116 @@ void Scheduler::Init() {
     for (unsigned i = 0; i < total; ++i) {
         MachineId_t mid = MachineId_t(i);
         machines.push_back(mid);
-
         auto mi = Machine_GetInfo(mid);
-        // Make sure hosts are awake; don’t attach VMs here.
         if (mi.s_state != S0) Machine_SetState(mid, S0);
     }
-
-    SimOutput("Scheduler::Init(): Machines discovered = " + to_string(machines.size()) + ". VMs will be created on demand.", 2);
+    SimOutput("SLA-Aware Consolidation Scheduler initialized, total machines = " + to_string(total), 2);
 }
 
-
-
-
-
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks
+    migrating_vms.erase(vm_id);
+    SimOutput("MigrationComplete(): VM " + to_string(vm_id) +
+              " migration done at " + to_string(time), 3);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
-    // Decide to attach the task to an existing VM, 
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
-    CPUType_t need_cpu = RequiredCPUType(task_id);   // X86 or ARM
-    VMType_t  need_vm  = RequiredVMType(task_id);    // LINUX / WIN / ...
-    SLAType_t sla      = RequiredSLA(task_id);       // SLA0..SLA3
-    bool      need_gpu = IsTaskGPUCapable(task_id);  // true if GPU needed
-    unsigned  mem_req  = GetTaskMemory(task_id);     // bytes (per Interfaces.h)
-
-    // Priority policy (example)
-    Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
-                     sla == SLA1 ? MID_PRIORITY   : LOW_PRIORITY);
-
-    // 1) Pick the best existing VM (least running_tasks) that satisfies constraints
-    size_t chosen_idx = SIZE_MAX;
-    size_t least_tasks = SIZE_MAX;
-
-    for (size_t i = 0; i < vmrecs.size(); ++i) {
-        const auto& rec = vmrecs[i];
-        if (rec.cpu_type != need_cpu) continue;             // CPU family must match
-        if (need_gpu && !rec.host_has_gpu) continue;        // need GPU
-        if (rec.vm_type != need_vm) continue;               // OS type (LINUX/WIN/...)
-
-        // Optional memory fit (only if your MachineInfo has memory_used/size)
-        auto mi = Machine_GetInfo(rec.host);
-        if (mi.memory_size >= mi.memory_used) {
-            unsigned free_mem = mi.memory_size - mi.memory_used;
-            if (free_mem < mem_req) continue;
-        }
-        // choose least-loaded VM
-        if (rec.running_tasks < least_tasks) {
-            least_tasks = rec.running_tasks;
-            chosen_idx  = i;
-        }
-    }
-
-    VMId_t chosen_vm;
-
-    // 2) If none exists, create a new compatible VM on a compatible host
-    if (chosen_idx == SIZE_MAX) {
-        MachineId_t host = (MachineId_t)(-1);
-        for (auto m : machines) {
-            auto mi = Machine_GetInfo(m);
-            if (mi.cpu != need_cpu) continue;
-            if (need_gpu && !mi.gpus) continue;
-
-            // Optional memory fit
-            if (mi.memory_size >= mi.memory_used) {
-                unsigned free_mem = mi.memory_size - mi.memory_used;
-                if (free_mem < mem_req) continue;
-            }
-
-            if (mi.s_state != S0) Machine_SetState(m, S0);  // wake host
-            host = m; break;
-        }
-        if (host == (MachineId_t)(-1)) {
-            SimOutput("NewTask(): No compatible host for task " + to_string(task_id), 0);
-            return; // or queue it
-        }
-
-        VMId_t vm = VM_Create(need_vm, need_cpu);
-        VM_Attach(vm, host);
-
-        auto mi = Machine_GetInfo(host);
-        vmrecs.push_back(VMRec{
-            .id           = vm,
-            .host         = host,
-            .vm_type      = need_vm,
-            .cpu_type     = need_cpu,
-            .host_has_gpu = mi.gpus,
-            .running_tasks= 0
-        });
-        chosen_idx = vmrecs.size() - 1;
-        chosen_vm  = vm;
-    } else {
-        chosen_vm  = vmrecs[chosen_idx].id;   // <- SET chosen from chosen_idx
-    }
-
-    // 3) Assign the task and update our bookkeeping
-    VM_AddTask(chosen_vm, task_id, pr);
-    vmrecs[chosen_idx].running_tasks++;
-    task_to_vm_index[task_id] = chosen_idx;
+    if (!TryPlaceTask(vmrecs, machines, task_to_vm_index, task_id))
+        pending_tasks.push_back(task_id);
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    // This method should be called from SchedulerCheck()
-    // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
-    // Unlike the other invocations of the scheduler, this one doesn't report any specific event
-    // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
-}
+    tick_counter++;
 
-void Scheduler::Shutdown(Time_t time) {
-    // Do your final reporting and bookkeeping here.
-    // Report about the total energy consumed
-    // Report about the SLA compliance
-    // Shutdown everything to be tidy :-)
-    for(auto & vm: vmrecs) {
-        VM_Shutdown(vm.id);
+    // Retry deferred tasks
+    size_t pend = pending_tasks.size();
+    for (size_t i = 0; i < pend; ++i) {
+        TaskId_t tid = pending_tasks.front();
+        pending_tasks.pop_front();
+        if (!TryPlaceTask(vmrecs, machines, task_to_vm_index, tid))
+            pending_tasks.push_back(tid);
     }
-    SimOutput("SimulationComplete(): Finished!", 4);
-    SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
+
+    // Retry pending migrations when destination is awake
+    size_t mig_count = pending_migrations.size();
+    for (size_t i = 0; i < mig_count; ++i) {
+        PendingMigration pm = pending_migrations.front();
+        pending_migrations.pop_front();
+        auto mi = Machine_GetInfo(pm.dst);
+        if (mi.s_state == S0 && !waking_machines.count(pm.dst)) {
+            try {
+                VM_Migrate(pm.vm, pm.dst);
+                migrating_vms.insert(pm.vm);
+                SimOutput("Deferred migration now executing: VM " +
+                          to_string(pm.vm) + " → " + to_string(pm.dst), 2);
+            } catch (...) {
+                SimOutput("Deferred migration failed for VM " + to_string(pm.vm), 1);
+            }
+        } else {
+            pending_migrations.push_back(pm);
+        }
+    }
+
+    // Periodic consolidation
+    if (tick_counter % MIGRATION_PERIOD != 0) return;
+
+    double s0 = GetSLAReport(SLA0), s1 = GetSLAReport(SLA1), s2 = GetSLAReport(SLA2);
+    if (s0 > SLA_VIOLATION_LIMIT || s1 > SLA_VIOLATION_LIMIT || s2 > SLA_VIOLATION_LIMIT) {
+        for (auto m : machines) {
+            auto mi = Machine_GetInfo(m);
+            if (mi.s_state != S0) Machine_SetState(m, S0);
+        }
+        SimOutput("SLA degraded → waking all machines.", 2);
+        return;
+    }
+
+    // Consolidation logic
+    for (auto src : machines) {
+        auto mi_src = Machine_GetInfo(src);
+        unsigned src_tasks = CountTasksOnMachine(vmrecs, src);
+        double src_util = (mi_src.num_cpus == 0 ? 1.0 : double(src_tasks)/double(mi_src.num_cpus));
+
+        if (src_tasks == 0) {
+            if (mi_src.s_state == S0) {
+                Machine_SetState(src, S3);
+                SimOutput("Machine " + to_string(src) + " idle → S3", 3);
+            }
+            continue;
+        }
+        if (src_util >= LOWER_UTIL_THRESH) continue;
+
+        // pick VM on src
+        VMId_t vmid = (VMId_t)(-1);
+        for (const auto& r : vmrecs)
+            if (r.host == src && !migrating_vms.count(r.id)) { vmid = r.id; break; }
+        if (vmid == (VMId_t)(-1)) continue;
+
+        CPUType_t cpu = mi_src.cpu;
+        MachineId_t dst;
+        if (!PickDestForConsolidation(machines, vmrecs, cpu, dst) || dst == src)
+            continue;
+
+        auto mi_dst = Machine_GetInfo(dst);
+        if (mi_dst.s_state != S0) {
+            if (!waking_machines.count(dst)) {
+                Machine_SetState(dst, S0);
+                waking_machines.insert(dst);
+                SimOutput("Dest " + to_string(dst) + " asleep → waking, deferring migration", 2);
+            }
+            pending_migrations.push_back({vmid, dst});
+            continue;
+        }
+
+        try {
+            VM_Migrate(vmid, dst);
+            migrating_vms.insert(vmid);
+            SimOutput("Migrating VM " + to_string(vmid) + " → " + to_string(dst), 2);
+        } catch (...) {
+            SimOutput("Migration failed for VM " + to_string(vmid), 1);
+        }
+    }
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    // Do any bookkeeping necessary for the data structures
-    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
-    // This is an opportunity to make any adjustments to optimize performance/energy
     auto it = task_to_vm_index.find(task_id);
     if (it != task_to_vm_index.end()) {
         size_t idx = it->second;
@@ -170,70 +274,34 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
             vmrecs[idx].running_tasks--;
         task_to_vm_index.erase(it);
     }
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+    SimOutput("TaskComplete(): Task " + to_string(task_id) + " done", 3);
 }
 
-// Public interface below
+void Scheduler::Shutdown(Time_t time) {
+    for (auto & r : vmrecs) VM_Shutdown(r.id);
+    for (auto m : machines) Machine_SetState(m, S5);
+    SimOutput("SLA-Aware Consolidation: Simulation complete", 2);
 
+    cout << "SLA violation report\n";
+    cout << "SLA0: " << GetSLAReport(SLA0) << "%\n";
+    cout << "SLA1: " << GetSLAReport(SLA1) << "%\n";
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%\n";
+    cout << "Total Energy: " << Machine_GetClusterEnergy() << " KW-Hour\n";
+    cout << "Simulation Time: " << double(time)/1e6 << " seconds\n";
+}
+
+// ---------- Simulator callbacks ----------
 static Scheduler scheduler;
+void InitScheduler() { scheduler.Init(); }
+void HandleNewTask(Time_t t, TaskId_t id) { scheduler.NewTask(t, id); }
+void HandleTaskCompletion(Time_t t, TaskId_t id) { scheduler.TaskComplete(t, id); }
+void MemoryWarning(Time_t t, MachineId_t m) { SimOutput("MemoryWarning(): machine " + to_string(m), 1); }
+void MigrationDone(Time_t t, VMId_t id) { scheduler.MigrationComplete(t, id); }
+void SchedulerCheck(Time_t t) { scheduler.PeriodicCheck(t); }
+void SimulationComplete(Time_t t) { scheduler.Shutdown(t); }
+void SLAWarning(Time_t t, TaskId_t id) { SimOutput("SLAWarning(): task " + to_string(id), 1); }
 
-void InitScheduler() {
-    SimOutput("InitScheduler(): Initializing scheduler", 4);
-    scheduler.Init();
+void StateChangeComplete(Time_t t, MachineId_t m) {
+    waking_machines.erase(m);
+    SimOutput("StateChangeComplete(): machine " + to_string(m) + " now awake (S0)", 3);
 }
-
-void HandleNewTask(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
-    scheduler.NewTask(time, task_id);
-}
-
-void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
-    scheduler.TaskComplete(time, task_id);
-}
-
-void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    // The simulator is alerting you that machine identified by machine_id is overcommitted
-    SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) + " was detected at time " + to_string(time), 0);
-}
-
-void MigrationDone(Time_t time, VMId_t vm_id) {
-    // The function is called on to alert you that migration is complete
-    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
-    scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
-}
-
-void SchedulerCheck(Time_t time) {
-    // This function is called periodically by the simulator, no specific event
-    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
-    scheduler.PeriodicCheck(time);
-    // static unsigned counts = 0;
-    // counts++;
-    // if(counts == 10) {
-    //     migrating = true;
-    //     VM_Migrate(1, 9);
-    // }
-}
-
-void SimulationComplete(Time_t time) {
-    // This function is called before the simulation terminates Add whatever you feel like.
-    cout << "SLA violation report" << endl;
-    cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
-    cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
-    cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
-    cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
-    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
-    
-    scheduler.Shutdown(time);
-}
-
-void SLAWarning(Time_t time, TaskId_t task_id) {
-    
-}
-
-void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    // Called in response to an earlier request to change the state of a machine
-}
-

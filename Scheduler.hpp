@@ -29,13 +29,12 @@ public:
     void PeriodicCheck(Time_t now);
     void Shutdown(Time_t time);
     void MigrationComplete(Time_t time, VMId_t vm_id);
+
 private:
     std::vector<VMRec> vmrecs;
     std::vector<MachineId_t> machines;
     std::unordered_map<TaskId_t, size_t> task_to_vm_index; // task → index in vmrecs
+    std::unordered_map<MachineId_t, unsigned> machine_tasks;
 };
-
-
-
 
 #endif /* Scheduler_hpp */

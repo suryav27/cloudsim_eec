@@ -2,7 +2,8 @@
 //  Scheduler.hpp
 //  CloudSim
 //
-//  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
+//  Fixed Greedy Power-Aware Scheduler Header
+//  Handles deferred VM attaches safely
 //
 
 #ifndef Scheduler_hpp
@@ -15,10 +16,17 @@
 struct VMRec {
     VMId_t      id;
     MachineId_t host;
-    VMType_t    vm_type;      // LINUX / WINDOWS...
-    CPUType_t   cpu_type;     // X86 / ARM
-    bool        host_has_gpu; // machine has a GPU?
-    size_t      running_tasks = 0; // we’ll track #active tasks ourselves
+    VMType_t    vm_type;
+    CPUType_t   cpu_type;
+    bool        host_has_gpu;
+    size_t      running_tasks = 0;
+};
+
+struct PendingAttach {
+    VMId_t vm;
+    MachineId_t host;
+    TaskId_t task_id;
+    Priority_t pr;
 };
 
 class Scheduler {
@@ -29,13 +37,14 @@ public:
     void PeriodicCheck(Time_t now);
     void Shutdown(Time_t time);
     void MigrationComplete(Time_t time, VMId_t vm_id);
+    void HandleWakeComplete(MachineId_t machine_id); // ✅ new function
+
 private:
     std::vector<VMRec> vmrecs;
     std::vector<MachineId_t> machines;
-    std::unordered_map<TaskId_t, size_t> task_to_vm_index; // task → index in vmrecs
+    std::unordered_map<TaskId_t, size_t> task_to_vm_index;
+    std::unordered_map<TaskId_t, Time_t> task_start_time;
+    std::unordered_map<TaskId_t, SLAType_t> task_sla;
 };
-
-
-
 
 #endif /* Scheduler_hpp */

@@ -22,12 +22,9 @@ void Scheduler::Init() {
     machines.reserve(total);
 
     for (unsigned i = 0; i < total; ++i) {
-        MachineId_t mid = MachineId_t(i);
-        machines.push_back(mid);
-
-        auto mi = Machine_GetInfo(mid);
-        // Make sure hosts are awake; don’t attach VMs here.
-        if (mi.s_state != S0) Machine_SetState(mid, S0);
+    MachineId_t mid = MachineId_t(i);
+    machines.push_back(mid);
+    // Leave machines in their default S-state; wake on demand later.
     }
 
     SimOutput("Scheduler::Init(): Machines discovered = " + to_string(machines.size()) + ". VMs will be created on demand.", 2);
@@ -138,6 +135,15 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     VM_AddTask(chosen_vm, task_id, pr);
     vmrecs[chosen_idx].running_tasks++;
     task_to_vm_index[task_id] = chosen_idx;
+    auto host = vmrecs[chosen_idx].host;
+    auto mi    = Machine_GetInfo(host);
+    double util = std::min(1.0, double(vmrecs[chosen_idx].running_tasks) / double(mi.num_cpus));
+    MaybeAdjustPState(host, util, now);
+    #if defined(HAVE_MACHINE_SET_PSTATE)
+        Machine_SetPState(host, machine_pstate[host]);
+    #elif defined(HAVE_MACHINE_SET_CPUPERF)
+        Machine_SetCPUPerformance(host, machine_pstate[host]);
+    #endif
 }
 
 void Scheduler::MaybeAdjustPState(MachineId_t m, double util, Time_t now) {
@@ -163,6 +169,61 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+    // 1) Build per-host running task count
+    // 1) Count how many running tasks are on each host
+    std::unordered_map<MachineId_t, unsigned> tasks_on_host;
+
+    for (const auto &rec : vmrecs)
+        tasks_on_host[rec.host] += rec.running_tasks;
+
+    // 2) Iterate over all known machines
+    static std::unordered_map<MachineId_t, Time_t> idle_since;
+    static constexpr Time_t IDLE_TO_S3 = 100000;   // 100 ms
+    static constexpr Time_t IDLE_TO_S5 = 500000;   // 500 ms
+
+    for (auto m : machines) {
+        auto mi = Machine_GetInfo(m);
+
+        // --- If machine is asleep (S3/S5), skip P-state tuning ---
+        if (mi.s_state != S0) continue;
+
+        // --- Estimate utilization: active tasks / number of cores ---
+        double util = 0.0;
+        if (tasks_on_host.count(m) && mi.num_cpus > 0)
+            util = std::min(1.0, double(tasks_on_host[m]) / double(mi.num_cpus));
+
+        // --- Adjust P-state based on utilization ---
+        MaybeAdjustPState(m, util, now);
+
+        // --- Apply the P-state to all cores ---
+        for (unsigned core = 0; core < mi.num_cpus; ++core) {
+            Machine_SetCorePerformance(m, core, machine_pstate[m]);
+        }
+
+        SimOutput("DVFS: Host " + to_string(m) +
+                  " util=" + to_string(util) +
+                  " → P" + to_string(machine_pstate[m]), 3);
+
+        // --- Sleep / wake management ---
+        if (tasks_on_host[m] == 0) {
+            // No active tasks → potentially go to sleep
+            if (!idle_since.count(m)) idle_since[m] = now;
+            Time_t idle_time = now - idle_since[m];
+
+            if (idle_time > IDLE_TO_S5 && mi.s_state != S5) {
+                Machine_SetState(m, S5);
+                SimOutput("Host " + to_string(m) + " → S5 (Power Off)", 3);
+            } else if (idle_time > IDLE_TO_S3 && mi.s_state == S0) {
+                Machine_SetState(m, S3);
+                SimOutput("Host " + to_string(m) + " → S3 (Sleep)", 3);
+            }
+        } else {
+            // Active → ensure it’s awake
+            idle_since.erase(m);
+            if (mi.s_state != S0)
+                Machine_SetState(m, S0);
+        }
+    }
 }
 
 void Scheduler::Shutdown(Time_t time) {

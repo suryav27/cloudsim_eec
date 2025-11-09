@@ -37,12 +37,12 @@ private:
     std::unordered_map<TaskId_t, size_t> task_to_vm_index; // task → index in vmrecs
     std::unordered_map<MachineId_t, CPUPerformance_t> machine_pstate;
     std::unordered_map<MachineId_t, Time_t> last_p_change;
-    static constexpr Time_t PSTATE_COOLDOWN = 20000; // 20 ms
+    static constexpr Time_t PSTATE_COOLDOWN = 500000;
 
     CPUPerformance_t PickPState(double util) {
-        if (util >= 0.80) return P0;
-        if (util >= 0.50) return P1;
-        if (util >= 0.25) return P2;
+        if (util >= 0.75) return P0;
+        if (util >= 0.45) return P1;
+        if (util >= 0.20) return P2;
         return P3;
     }
     void MaybeAdjustPState(MachineId_t m, double util, Time_t now);

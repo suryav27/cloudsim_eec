@@ -21,17 +21,24 @@ void Scheduler::Init() {
     machines.clear();
     machines.reserve(total);
 
+    SimOutput("Scheduler::Init(): Initializing " + to_string(total) +
+              " machines for DVFS power-aware scheduling.", 2);
+
     for (unsigned i = 0; i < total; ++i) {
-    MachineId_t mid = MachineId_t(i);
-    machines.push_back(mid);
-    // Leave machines in their default S-state; wake on demand later.
+        MachineId_t mid = MachineId_t(i);
+        machines.push_back(mid);
+
+        // Explicitly start each host in the deepest sleep state (S5)
+        Machine_SetState(mid, S5);
+
+        // Initialize DVFS bookkeeping
+        machine_pstate[mid] = P3;           // lowest-performance, lowest-power
+        last_p_change[mid]  = 0;            // reset cooldown timer
     }
 
-    SimOutput("Scheduler::Init(): Machines discovered = " + to_string(machines.size()) + ". VMs will be created on demand.", 2);
+    SimOutput("Scheduler::Init(): Machines set to S5 (powered-off). "
+              "They will wake on demand when tasks arrive.", 2);
 }
-
-
-
 
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
@@ -56,94 +63,134 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    CPUType_t need_cpu = RequiredCPUType(task_id);   // X86 or ARM
+    CPUType_t need_cpu = RequiredCPUType(task_id);   // X86 / ARM
     VMType_t  need_vm  = RequiredVMType(task_id);    // LINUX / WIN / ...
     SLAType_t sla      = RequiredSLA(task_id);       // SLA0..SLA3
     bool      need_gpu = IsTaskGPUCapable(task_id);  // true if GPU needed
-    unsigned  mem_req  = GetTaskMemory(task_id);     // bytes (per Interfaces.h)
+    unsigned  mem_req  = GetTaskMemory(task_id);     // memory requirement (MB or consistent unit)
 
-    // Priority policy (example)
+    // Priority policy (based on SLA)
     Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
-                     sla == SLA1 ? MID_PRIORITY   : LOW_PRIORITY);
+                     sla == SLA1 ? MID_PRIORITY :
+                                   LOW_PRIORITY);
 
-    // 1) Pick the best existing VM (least running_tasks) that satisfies constraints
+    // --- 2) Try to find an existing VM that fits the requirements ---
     size_t chosen_idx = SIZE_MAX;
     size_t least_tasks = SIZE_MAX;
 
     for (size_t i = 0; i < vmrecs.size(); ++i) {
         const auto& rec = vmrecs[i];
-        if (rec.cpu_type != need_cpu) continue;             // CPU family must match
-        if (need_gpu && !rec.host_has_gpu) continue;        // need GPU
-        if (rec.vm_type != need_vm) continue;               // OS type (LINUX/WIN/...)
+        if (rec.cpu_type != need_cpu) continue;
+        if (need_gpu && !rec.host_has_gpu) continue;
+        if (rec.vm_type != need_vm) continue;
 
-        // Optional memory fit (only if your MachineInfo has memory_used/size)
         auto mi = Machine_GetInfo(rec.host);
-        if (mi.memory_size >= mi.memory_used) {
-            unsigned free_mem = mi.memory_size - mi.memory_used;
-            if (free_mem < mem_req) continue;
-        }
-        // choose least-loaded VM
+        unsigned free_mem = mi.memory_size - mi.memory_used;
+        if (free_mem < mem_req) continue;
+
+        // Prefer VM with fewest running tasks
         if (rec.running_tasks < least_tasks) {
             least_tasks = rec.running_tasks;
-            chosen_idx  = i;
+            chosen_idx = i;
         }
     }
 
     VMId_t chosen_vm;
 
-    // 2) If none exists, create a new compatible VM on a compatible host
+    // --- 3) If no existing VM fits, create a new one on a compatible host ---
     if (chosen_idx == SIZE_MAX) {
         MachineId_t host = (MachineId_t)(-1);
-        for (auto m : machines) {
-            auto mi = Machine_GetInfo(m);
-            if (mi.cpu != need_cpu) continue;
-            if (need_gpu && !mi.gpus) continue;
 
-            // Optional memory fit
-            if (mi.memory_size >= mi.memory_used) {
-                unsigned free_mem = mi.memory_size - mi.memory_used;
-                if (free_mem < mem_req) continue;
+        for (auto m : machines) {
+            MachineInfo_t mi = Machine_GetInfo(m);
+
+            // Try to reuse an already awake host first
+            if (mi.s_state == S0 && mi.cpu == need_cpu &&
+                (!need_gpu || mi.gpus)) {
+                host = m;
+                break;
             }
 
-            if (mi.s_state != S0) Machine_SetState(m, S0);  // wake host
-            host = m; break;
+            // Otherwise wake one sleeping host only if absolutely needed
+            if (host == (MachineId_t)(-1) && mi.s_state != S0 &&
+                mi.cpu == need_cpu && (!need_gpu || mi.gpus)) {
+                Machine_SetState(m, S0);
+                SimOutput("DVFS: Waking host " + to_string(m), 2);
+                host = m;
+                break;
+            }
+
+            // --- Re-read fields after wake ---
+            bool gpu_cap = mi.gpus;
+            CPUType_t host_cpu = mi.cpu;
+
+            // --- Debug: show what we’re checking ---
+            SimOutput("Task " + to_string(task_id) +
+                    " needsGPU=" + to_string(need_gpu) +
+                    " host=" + to_string(m) +
+                    " s_state=" + to_string(mi.s_state) +
+                    " cpu=" + to_string(host_cpu) +
+                    " mem=" + to_string(mi.memory_size) +
+                    " gpu=" + to_string(gpu_cap), 2);
+
+            // --- Compatibility checks ---
+            if (host_cpu != need_cpu) continue;
+            if (need_gpu && !gpu_cap) continue;
+
+            unsigned free_mem = (mi.memory_size > mi.memory_used)
+                                ? mi.memory_size - mi.memory_used
+                                : mi.memory_size;
+            if (free_mem < mem_req) continue;
+
+            host = m;
+            break;
         }
+
+
         if (host == (MachineId_t)(-1)) {
             SimOutput("NewTask(): No compatible host for task " + to_string(task_id), 0);
-            return; // or queue it
+            return;
         }
 
         VMId_t vm = VM_Create(need_vm, need_cpu);
         VM_Attach(vm, host);
 
-        auto mi = Machine_GetInfo(host);
+        auto host_info = Machine_GetInfo(host);
         vmrecs.push_back(VMRec{
-            .id           = vm,
-            .host         = host,
-            .vm_type      = need_vm,
-            .cpu_type     = need_cpu,
-            .host_has_gpu = mi.gpus,
-            .running_tasks= 0
+            .id            = vm,
+            .host          = host,
+            .vm_type       = need_vm,
+            .cpu_type      = need_cpu,
+            .host_has_gpu  = host_info.gpus,
+            .running_tasks = 0
         });
+
         chosen_idx = vmrecs.size() - 1;
         chosen_vm  = vm;
     } else {
-        chosen_vm  = vmrecs[chosen_idx].id;   // <- SET chosen from chosen_idx
+        chosen_vm = vmrecs[chosen_idx].id;
     }
-
-    // 3) Assign the task and update our bookkeeping
+    // --- 4) Assign the task to the VM and update bookkeeping ---
     VM_AddTask(chosen_vm, task_id, pr);
     vmrecs[chosen_idx].running_tasks++;
     task_to_vm_index[task_id] = chosen_idx;
+
+    // --- 5) DVFS adjustment for the host after placement ---
     auto host = vmrecs[chosen_idx].host;
-    auto mi    = Machine_GetInfo(host);
-    double util = std::min(1.0, double(vmrecs[chosen_idx].running_tasks) / double(mi.num_cpus));
+    auto mi   = Machine_GetInfo(host);
+    double util = 0.0;
+    if (mi.num_cpus > 0)
+        util = std::min(1.0, double(vmrecs[chosen_idx].running_tasks) / double(mi.num_cpus));
+
     MaybeAdjustPState(host, util, now);
-    #if defined(HAVE_MACHINE_SET_PSTATE)
-        Machine_SetPState(host, machine_pstate[host]);
-    #elif defined(HAVE_MACHINE_SET_CPUPERF)
-        Machine_SetCPUPerformance(host, machine_pstate[host]);
-    #endif
+
+    // Apply the new P-state
+    for (unsigned core = 0; core < mi.num_cpus; ++core)
+        Machine_SetCorePerformance(host, core, machine_pstate[host]);
+
+    SimOutput("DVFS: Host " + to_string(host) +
+              " util=" + to_string(util) +
+              " → P-state " + to_string(machine_pstate[host]), 3);
 }
 
 void Scheduler::MaybeAdjustPState(MachineId_t m, double util, Time_t now) {
@@ -162,6 +209,10 @@ void Scheduler::MaybeAdjustPState(MachineId_t m, double util, Time_t now) {
                         target == P2 ? "P2 (Medium)" : "P3 (Low)");
         SimOutput("DVFS: Adjusted Host " + to_string(m) + " → " + level, 3);
     }
+    auto mi = Machine_GetInfo(m); // Retrieve machine info
+    for (unsigned core = 0; core < mi.num_cpus; ++core)
+        Machine_SetCorePerformance(m, core, machine_pstate[m]);
+
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {

@@ -1,10 +1,3 @@
-//
-//  Scheduler.hpp
-//  CloudSim
-//
-//  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
-//
-
 #ifndef Scheduler_hpp
 #define Scheduler_hpp
 
@@ -15,10 +8,10 @@
 struct VMRec {
     VMId_t      id;
     MachineId_t host;
-    VMType_t    vm_type;      // LINUX / WINDOWS...
-    CPUType_t   cpu_type;     // X86 / ARM
-    bool        host_has_gpu; // machine has a GPU?
-    size_t      running_tasks = 0; // we’ll track #active tasks ourselves
+    VMType_t    vm_type;
+    CPUType_t   cpu_type;
+    bool        host_has_gpu;
+    size_t      running_tasks = 0;
 };
 
 class Scheduler {
@@ -30,10 +23,14 @@ public:
     void Shutdown(Time_t time);
     void MigrationComplete(Time_t time, VMId_t vm_id);
 
-private:
+    bool PlaceOrDeferTask(TaskId_t task_id);  // ← ADD THIS LINE
+
+    // Temporary: make accessible to StateChangeComplete
     std::vector<VMRec> vmrecs;
+    std::unordered_map<TaskId_t, size_t> task_to_vm_index;
+
+private:
     std::vector<MachineId_t> machines;
-    std::unordered_map<TaskId_t, size_t> task_to_vm_index; // task → index in vmrecs
     std::unordered_map<MachineId_t, unsigned> machine_tasks;
 };
 

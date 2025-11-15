@@ -28,12 +28,10 @@ void Scheduler::Init() {
         MachineId_t mid = MachineId_t(i);
         machines.push_back(mid);
 
-        // Explicitly start each host in the deepest sleep state (S5)
         Machine_SetState(mid, S5);
 
-        // Initialize DVFS bookkeeping
-        machine_pstate[mid] = P3;           // lowest-performance, lowest-power
-        last_p_change[mid]  = 0;            // reset cooldown timer
+        machine_pstate[mid] = P3;           
+        last_p_change[mid]  = 0;            
     }
 
     SimOutput("Scheduler::Init(): Machines set to S5 (powered-off). "
@@ -63,18 +61,17 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    CPUType_t need_cpu = RequiredCPUType(task_id);   // X86 / ARM
-    VMType_t  need_vm  = RequiredVMType(task_id);    // LINUX / WIN / ...
-    SLAType_t sla      = RequiredSLA(task_id);       // SLA0..SLA3
-    bool      need_gpu = IsTaskGPUCapable(task_id);  // true if GPU needed
-    unsigned  mem_req  = GetTaskMemory(task_id);     // memory requirement (MB or consistent unit)
+    CPUType_t need_cpu = RequiredCPUType(task_id);   
+    VMType_t  need_vm  = RequiredVMType(task_id);    
+    SLAType_t sla      = RequiredSLA(task_id);       
+    bool      need_gpu = IsTaskGPUCapable(task_id);  
+    unsigned  mem_req  = GetTaskMemory(task_id);     
 
-    // Priority policy (based on SLA)
     Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
                      sla == SLA1 ? MID_PRIORITY :
                                    LOW_PRIORITY);
 
-    // --- 2) Try to find an existing VM that fits the requirements ---
+    // find an existing VM that fits the requirements
     size_t chosen_idx = SIZE_MAX;
     size_t least_tasks = SIZE_MAX;
 
@@ -88,7 +85,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         unsigned free_mem = mi.memory_size - mi.memory_used;
         if (free_mem < mem_req) continue;
 
-        // Prefer VM with fewest running tasks
         if (rec.running_tasks < least_tasks) {
             least_tasks = rec.running_tasks;
             chosen_idx = i;
@@ -97,21 +93,19 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
     VMId_t chosen_vm;
 
-    // --- 3) If no existing VM fits, create a new one on a compatible host ---
+    //If no existing VM fits, create a new one on a compatible host
     if (chosen_idx == SIZE_MAX) {
         MachineId_t host = (MachineId_t)(-1);
 
         for (auto m : machines) {
             MachineInfo_t mi = Machine_GetInfo(m);
 
-            // Try to reuse an already awake host first
             if (mi.s_state == S0 && mi.cpu == need_cpu &&
                 (!need_gpu || mi.gpus)) {
                 host = m;
                 break;
             }
 
-            // Otherwise wake one sleeping host only if absolutely needed
             if (host == (MachineId_t)(-1) && mi.s_state != S0 &&
                 mi.cpu == need_cpu && (!need_gpu || mi.gpus)) {
                 Machine_SetState(m, S0);
@@ -120,11 +114,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 break;
             }
 
-            // --- Re-read fields after wake ---
             bool gpu_cap = mi.gpus;
             CPUType_t host_cpu = mi.cpu;
 
-            // --- Debug: show what we’re checking ---
             SimOutput("Task " + to_string(task_id) +
                     " needsGPU=" + to_string(need_gpu) +
                     " host=" + to_string(m) +
@@ -133,7 +125,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                     " mem=" + to_string(mi.memory_size) +
                     " gpu=" + to_string(gpu_cap), 2);
 
-            // --- Compatibility checks ---
             if (host_cpu != need_cpu) continue;
             if (need_gpu && !gpu_cap) continue;
 
@@ -146,7 +137,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             break;
         }
 
-
         if (host == (MachineId_t)(-1)) {
             SimOutput("NewTask(): No compatible host for task " + to_string(task_id), 0);
             return;
@@ -155,6 +145,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         VMId_t vm = VM_Create(need_vm, need_cpu);
         VM_Attach(vm, host);
 
+        //Chat GPT helped come up with push_back 
         auto host_info = Machine_GetInfo(host);
         vmrecs.push_back(VMRec{
             .id            = vm,
@@ -170,12 +161,12 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     } else {
         chosen_vm = vmrecs[chosen_idx].id;
     }
-    // --- 4) Assign the task to the VM and update bookkeeping ---
+    // Assign the task to the VM 
     VM_AddTask(chosen_vm, task_id, pr);
     vmrecs[chosen_idx].running_tasks++;
     task_to_vm_index[task_id] = chosen_idx;
 
-    // --- 5) DVFS adjustment for the host after placement ---
+    // DVFS adjustment for the host after placement
     auto host = vmrecs[chosen_idx].host;
     auto mi   = Machine_GetInfo(host);
     double util = 0.0;
@@ -209,12 +200,13 @@ void Scheduler::MaybeAdjustPState(MachineId_t m, double util, Time_t now) {
                         target == P2 ? "P2 (Medium)" : "P3 (Low)");
         SimOutput("DVFS: Adjusted Host " + to_string(m) + " → " + level, 3);
     }
-    auto mi = Machine_GetInfo(m); // Retrieve machine info
+    auto mi = Machine_GetInfo(m); 
     for (unsigned core = 0; core < mi.num_cpus; ++core)
         Machine_SetCorePerformance(m, core, machine_pstate[m]);
 
 }
 
+//ChatGPT helped with identifying edges cases for checking periodically 
 void Scheduler::PeriodicCheck(Time_t now) {
     // This method should be called from SchedulerCheck()
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
@@ -227,26 +219,23 @@ void Scheduler::PeriodicCheck(Time_t now) {
     for (const auto &rec : vmrecs)
         tasks_on_host[rec.host] += rec.running_tasks;
 
-    // 2) Iterate over all known machines
+
     static std::unordered_map<MachineId_t, Time_t> idle_since;
-    static constexpr Time_t IDLE_TO_S3 = 100000;   // 100 ms
-    static constexpr Time_t IDLE_TO_S5 = 500000;   // 500 ms
+    static constexpr Time_t IDLE_TO_S3 = 100000;   
+    static constexpr Time_t IDLE_TO_S5 = 500000;   
 
     for (auto m : machines) {
         auto mi = Machine_GetInfo(m);
 
-        // --- If machine is asleep (S3/S5), skip P-state tuning ---
+        // if machine is asleep
         if (mi.s_state != S0) continue;
 
-        // --- Estimate utilization: active tasks / number of cores ---
         double util = 0.0;
         if (tasks_on_host.count(m) && mi.num_cpus > 0)
             util = std::min(1.0, double(tasks_on_host[m]) / double(mi.num_cpus));
 
-        // --- Adjust P-state based on utilization ---
         MaybeAdjustPState(m, util, now);
 
-        // --- Apply the P-state to all cores ---
         for (unsigned core = 0; core < mi.num_cpus; ++core) {
             Machine_SetCorePerformance(m, core, machine_pstate[m]);
         }
@@ -255,9 +244,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                   " util=" + to_string(util) +
                   " → P" + to_string(machine_pstate[m]), 3);
 
-        // --- Sleep / wake management ---
         if (tasks_on_host[m] == 0) {
-            // No active tasks → potentially go to sleep
             if (!idle_since.count(m)) idle_since[m] = now;
             Time_t idle_time = now - idle_since[m];
 
@@ -269,7 +256,6 @@ void Scheduler::PeriodicCheck(Time_t now) {
                 SimOutput("Host " + to_string(m) + " → S3 (Sleep)", 3);
             }
         } else {
-            // Active → ensure it’s awake
             idle_since.erase(m);
             if (mi.s_state != S0)
                 Machine_SetState(m, S0);

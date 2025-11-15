@@ -27,7 +27,7 @@ void Scheduler::Init() {
         machines.push_back(mid);
 
         auto mi = Machine_GetInfo(mid);
-        // Make sure hosts are awake; don’t attach VMs here.
+        // Make sure hosts are awake
         if (mi.s_state != S0) Machine_SetState(mid, S0);
     }
 
@@ -49,7 +49,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     for (auto &rec : vmrecs) {
         if (rec.id == vm_id) {
             auto vmi = VM_GetInfo(vm_id);
-            rec.host = vmi.machine_id; // authoritative new host
+            rec.host = vmi.machine_id; 
             break;
         }
     }
@@ -58,13 +58,12 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 }
 
 void Scheduler::FlushPending() {
-    // Sort pending tasks in decreasing order of memory (BFD requirement)
     std::sort(pending.begin(), pending.end(),
         [](const PendingItem &a, const PendingItem &b) {
-            return a.mem > b.mem; // descending
+            return a.mem > b.mem; 
         });
 
-    // Place each pending task using the same best-fit logic as NewTask
+    // ChatGPT helped make this 
     for (auto &item : pending) {
         TaskId_t tid = item.tid;
         unsigned mem_req = item.mem;
@@ -76,7 +75,7 @@ void Scheduler::FlushPending() {
         Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
                         (sla == SLA1 ? MID_PRIORITY : LOW_PRIORITY));
 
-        // --- Best-fit placement identical to your NewTask code ---
+        // best-fit code 
         double best_gap = 1e18;
         double best_tiebreak_util = -1.0;
         size_t best_idx = SIZE_MAX;
@@ -104,7 +103,7 @@ void Scheduler::FlushPending() {
         size_t chosen_idx;
 
         if (best_idx == SIZE_MAX) {
-            // Create new host+VM if no fit (same as your code)
+            // create new host if none exist 
             MachineId_t chosen_host = (MachineId_t)(-1);
             for (auto m : machines) {
                 auto mi = Machine_GetInfo(m);
@@ -171,25 +170,22 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     //
     // Other possibilities as desired
     // --- Query task requirements ---
-    CPUType_t need_cpu = RequiredCPUType(task_id);   // X86 / ARM
-    VMType_t  need_vm  = RequiredVMType(task_id);    // LINUX / WIN / ...
-    SLAType_t sla      = RequiredSLA(task_id);       // SLA0..SLA3
-    bool      need_gpu = IsTaskGPUCapable(task_id);  // GPU flag
-    unsigned  mem_req  = GetTaskMemory(task_id);     // memory requirement (units consistent with MachineInfo)
+    CPUType_t need_cpu = RequiredCPUType(task_id);  
+    VMType_t  need_vm  = RequiredVMType(task_id);    
+    SLAType_t sla      = RequiredSLA(task_id);       
+    bool      need_gpu = IsTaskGPUCapable(task_id);  
+    unsigned  mem_req  = GetTaskMemory(task_id);     
 
-    // Buffer this task for batch placement (BFD batching)
+    //Idea came from ChatGPT
     pending.push_back({task_id, mem_req, need_cpu, need_vm, need_gpu, sla, now});
 
-    // If we’ve collected enough tasks, flush and place them all
     if (pending.size() >= BFD_BATCH) {
         FlushPending();
     }
     return;
-    // --- Priority from SLA (simple mapping) ---
     Priority_t pr = (sla == SLA0 ? HIGH_PRIORITY :
                     (sla == SLA1 ? MID_PRIORITY   : LOW_PRIORITY));
 
-    // --- Best-Fit search among existing VMs (consolidation) ---
     double best_gap = 1e18;
     double best_tiebreak_util = -1.0;
     size_t best_idx = SIZE_MAX;
@@ -204,7 +200,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
         // Current host capacity
         auto mi = Machine_GetInfo(rec.host);
-        if (mi.memory_used > mi.memory_size) continue;              // defensive
+        if (mi.memory_used > mi.memory_size) continue;              
         unsigned free_mem = mi.memory_size - mi.memory_used;
         if (free_mem < mem_req) continue;
 
@@ -224,13 +220,12 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     VMId_t chosen_vm;
     size_t chosen_idx;
 
-    // --- If no existing VM fits, create one on the best host (prefer already-on, utilized hosts) ---
     if (best_idx == SIZE_MAX) {
         MachineId_t chosen_host = (MachineId_t)(-1);
         double best_host_util = -1.0;
         double best_host_gap  = 1e18;
 
-        // First pass: prefer hosts that are already S0 (awake) to avoid wakeup penalties
+        // First pass: S0 hosts preferred 
         for (auto m : machines) {
             auto mi = Machine_GetInfo(m);
             if (mi.cpu != need_cpu) continue;
@@ -262,7 +257,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
                 unsigned free_mem = mi.memory_size - mi.memory_used;
                 if (free_mem < mem_req) continue;
 
-                // Wake this one and take it
                 if (mi.s_state != S0) Machine_SetState(m, S0);
                 chosen_host = m;
                 break;
@@ -271,10 +265,10 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
         if (chosen_host == (MachineId_t)(-1)) {
             SimOutput("NewTask(): No compatible host for task " + to_string(task_id), 0);
-            return; // could queue instead
+            return; 
         }
 
-        // Create and attach a new compatible VM
+        // ChatGPT helped with this 
         VMId_t vm = VM_Create(need_vm, need_cpu);
         VM_Attach(vm, chosen_host);
 
@@ -297,7 +291,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         chosen_vm  = vmrecs[best_idx].id;
     }
 
-    // --- Assign task and update scheduler bookkeeping ---
     VM_AddTask(chosen_vm, task_id, pr);
     vmrecs[chosen_idx].running_tasks++;
     vmrecs[chosen_idx].vm_mem_used += mem_req;
@@ -321,18 +314,14 @@ void Scheduler::PeriodicCheck(Time_t now) {
         last_flush = now;
     }
 
-    // --------- Try to consolidate: migrate VMs off underutilized hosts ----------
-    // Strategy: for each VM whose host is underutilized, try to move it to a better (more utilized) compatible host,
-    // using a best-fit-by-free-memory destination to pack tightly.
     for (size_t s = 0; s < vmrecs.size(); ++s) {
         auto &src_vm = vmrecs[s];
         if (src_vm.running_tasks == 0) continue; // nothing to migrate
 
         auto mi_src_host = Machine_GetInfo(src_vm.host);
         double src_util  = GetMachineUtilization(src_vm.host);
-        if (src_util >= LOW_UTIL_THRESHOLD) continue; // only nudge clearly underutilized hosts
+        if (src_util >= LOW_UTIL_THRESHOLD) continue; 
 
-        // Choose best destination host (best-fit on free mem; tie-break by higher util)
         MachineId_t best_dst_host = (MachineId_t)(-1);
         double      best_gap      = 1e18;
         double      best_util     = -1.0;
@@ -341,16 +330,15 @@ void Scheduler::PeriodicCheck(Time_t now) {
             if (d == s) continue;
             const auto &dst_vm = vmrecs[d];
 
-            // VM-level constraints must remain valid on destination host
             if (dst_vm.cpu_type != src_vm.cpu_type) continue;
             if (src_vm.host_has_gpu && !dst_vm.host_has_gpu) continue;
             if (dst_vm.vm_type != src_vm.vm_type) continue;
 
             auto mi_dst = Machine_GetInfo(dst_vm.host);
-            if (mi_dst.memory_used > mi_dst.memory_size) continue; // defensive
+            if (mi_dst.memory_used > mi_dst.memory_size) continue; 
             unsigned free_mem = mi_dst.memory_size - mi_dst.memory_used;
 
-            if (free_mem < src_vm.vm_mem_used) continue; // must fit the whole VM’s footprint
+            if (free_mem < src_vm.vm_mem_used) continue;
 
             double gap  = static_cast<double>(free_mem) - static_cast<double>(src_vm.vm_mem_used);
             double util = GetMachineUtilization(dst_vm.host);
@@ -369,12 +357,10 @@ void Scheduler::PeriodicCheck(Time_t now) {
             SimOutput("PeriodicCheck(): Migrating VM " + to_string(src_vm.id) +
                       " from host " + to_string(src_vm.host) +
                       " to host " + to_string(best_dst_host), 3);
-            // Let MigrationDone()/MigrationComplete() fix up the host field when sim confirms.
-            break; // one migration per check is usually enough; remove 'break' to be more aggressive
+            break; 
         }
     }
 
-    // --------- Power management with hysteresis (S3 then S5) ----------
     for (auto m : machines) {
         auto mi = Machine_GetInfo(m);
 
@@ -389,7 +375,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
                 if (mi.s_state == S0) Machine_SetState(m, S3);
             }
         } else {
-            // host is in use → must be awake
+            // host is in use 
             idle_since.erase(m);
             if (mi.s_state != S0) Machine_SetState(m, S0);
         }

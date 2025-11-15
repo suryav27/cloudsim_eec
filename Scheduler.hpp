@@ -23,9 +23,8 @@ public:
     void Shutdown(Time_t time);
     void MigrationComplete(Time_t time, VMId_t vm_id);
 
-    bool PlaceOrDeferTask(TaskId_t task_id);  // ← ADD THIS LINE
+    bool PlaceOrDeferTask(TaskId_t task_id); 
 
-    // Temporary: make accessible to StateChangeComplete
     std::vector<VMRec> vmrecs;
     std::unordered_map<TaskId_t, size_t> task_to_vm_index;
 

@@ -24,7 +24,6 @@ static bool HostCompatible(const MachineInfo_t& mi, CPUType_t need_cpu, bool nee
 }
 
 // Find the least-loaded **awake (S0)** compatible host.
-// If none are awake (shouldn’t happen because we keep them awake), we’ll wake one and still pick it.
 static bool PickAwakeHost(const vector<MachineId_t>& machines,
                           const vector<VMRec>& vmrecs,
                           CPUType_t need_cpu, bool need_gpu,
@@ -40,7 +39,6 @@ static bool PickAwakeHost(const vector<MachineId_t>& machines,
         // keep everything awake
         if (mi.s_state != S0) Machine_SetState(m, S0);
 
-        // utilization proxy = active_vms / cores (fallback to 1 if zero)
         double denom = (mi.num_cpus > 0 ? double(mi.num_cpus) : 1.0);
         double util  = double(mi.active_vms) / denom;
 
@@ -78,7 +76,7 @@ static ssize_t PickExistingVMReady(const vector<VMRec>& vmrecs,
     return best;
 }
 
-// -------------------- Scheduler --------------------
+// Scheduler
 void Scheduler::Init() {
     unsigned total = Machine_GetTotal();
 
@@ -174,7 +172,6 @@ void Scheduler::TaskComplete(Time_t /*now*/, TaskId_t task_id) {
 }
 
 void Scheduler::Shutdown(Time_t time) {
-    // Leave machines awake; just shut down VMs.
     for (auto & r : vmrecs) VM_Shutdown(r.id);
 
     cout << "SLA violation report\n";
